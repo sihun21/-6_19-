@@ -1,0 +1,575 @@
+import cv2
+import numpy as np
+import matplotlib.colors as mcolors
+
+# --- Machado (2009) 변환 행렬 (severity=1.0 기준) ---
+CVD_MATRICES = {
+    "protan": np.array([
+        [0.152286, 1.052583, -0.204868],
+        [0.114503, 0.786281, 0.099216],
+        [-0.003882, -0.048116, 1.051998]
+    ]),
+    "deutan": np.array([
+        [0.367322, 0.860646, -0.227968],
+        [0.280085, 0.672501, 0.047413],
+        [-0.011820, 0.042940, 0.968881]
+    ]),
+    "tritan": np.array([
+        [1.255528, -0.076749, -0.178779],
+        [-0.078411, 0.930809, 0.147602],
+        [0.004733, 0.691367, 0.303900]
+    ])
+}
+
+def simulate_colorblind_machado(img, cb_type, severity=1.0):
+    """Machado 시뮬레이션 + 강도 조절"""
+    if cb_type not in CVD_MATRICES:
+        return img
+    matrix = CVD_MATRICES[cb_type]
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    reshaped = img_rgb.reshape(-1, 3)
+    transformed = reshaped @ matrix.T
+    transformed = np.clip(transformed, 0, 1)
+
+    blended = (1 - severity) * reshaped + severity * transformed
+    blended = np.clip(blended, 0, 1)
+    result = (blended.reshape(img.shape) * 255).astype(np.uint8)
+    return cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+
+def daltonize(img, cb_type, severity=1.0, amplify=1.5):
+    """Daltonization: 색약 보정"""
+    if cb_type not in CVD_MATRICES:
+        return img
+    matrix = CVD_MATRICES[cb_type]
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    reshaped = img_rgb.reshape(-1, 3)
+
+    simulated_initial = reshaped @ matrix.T
+    simulated = (1 - severity) * reshaped + severity * simulated_initial
+    simulated = np.clip(simulated, 0, 1)
+
+    error = reshaped - simulated
+    corrected = reshaped + amplify * error
+    corrected = np.clip(corrected, 0, 1)
+
+    result = (corrected.reshape(img.shape) * 255).astype(np.uint8)
+    return cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+
+# --- 사용자 제공 도우미 함수 (matplotlib.colors 사용) ---
+def get_color_name(rgb_tuple):
+    rgb_normalized = (rgb_tuple[0] / 255.0, rgb_tuple[1] / 255.0, rgb_tuple[2] / 255.0)
+    min_distance = float('inf')
+    closest_color_name = "Unknown Color"
+    for name, hex_value in mcolors.CSS4_COLORS.items():
+        color_rgb_normalized = mcolors.to_rgb(hex_value)
+        distance = sum([(c1 - c2) ** 2 for c1, c2 in zip(rgb_normalized, color_rgb_normalized)])
+        if distance < min_distance:
+            min_distance = distance
+            closest_color_name = name
+    return closest_color_name.replace("grey", "gray")
+
+# --- 6_1.py 에서 가져온 함수 및 전역 변수 ---
+drawing = False
+ix, iy = -1, -1
+rx1, ry1, rx2, ry2 = -1, -1, -1, -1 # 드래그 영역 좌표
+
+# 대비 조절 함수 (6_1.py에서 가져옴, 현재 사용되지 않으나 혹시 몰라 유지)
+def increase_contrast(img):
+    return cv2.convertScaleAbs(img, alpha=2.0, beta=0)
+
+# 드래그 영역 내에서만 * 표시 (6_1.py에서 가져옴)
+def draw_stars(img, rx1, ry1, rx2, ry2):
+    output = img.copy()
+    # 이 함수는 이제 전체 화면에 별을 그리는 용도로만 사용됨
+    # 특정 색깔 (붉은색 계열)에만 적용
+    for y in range(0, img.shape[0], 10): # 전체 높이
+        for x in range(0, img.shape[1], 10): # 전체 너비
+            b, g, r = img[y, x]
+            if r > 1.5 * g and r > 1.5 * b and r > 100:
+                cv2.putText(output, '*', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+    return output
+
+# --- 전역 상태 변수 ---
+active_cb_type = None  # "protan", "deutan", "tritan"
+active_cb_mode = None  # "simulate", "correct"
+active_special_filter = None # "region_filter", "star_filter"
+
+# --- UI 요소 정의 및 설정 ---
+icon_base_size = 60
+button_text_scale = 0.9
+button_text_thickness = 2
+
+# 시뮬레이션 버튼 아이콘
+btn_icon_p = np.zeros((icon_base_size, icon_base_size, 3), dtype=np.uint8)
+btn_icon_p[:] = (0, 0, 200)
+cv2.putText(btn_icon_p, "P", (int(icon_base_size * 0.25), int(icon_base_size * 0.7)), cv2.FONT_HERSHEY_SIMPLEX,
+            button_text_scale, (255, 255, 255), button_text_thickness, cv2.LINE_AA)
+
+btn_icon_d = np.zeros((icon_base_size, icon_base_size, 3), dtype=np.uint8)
+btn_icon_d[:] = (0, 200, 0)
+cv2.putText(btn_icon_d, "D", (int(icon_base_size * 0.25), int(icon_base_size * 0.7)), cv2.FONT_HERSHEY_SIMPLEX,
+            button_text_scale, (255, 255, 255), button_text_thickness, cv2.LINE_AA)
+
+btn_icon_t = np.zeros((icon_base_size, icon_base_size, 3), dtype=np.uint8)
+btn_icon_t[:] = (200, 0, 0)
+cv2.putText(btn_icon_t, "T", (int(icon_base_size * 0.25), int(icon_base_size * 0.7)), cv2.FONT_HERSHEY_SIMPLEX,
+            button_text_scale, (255, 255, 255), button_text_thickness, cv2.LINE_AA)
+
+# 보정 (Daltonize) 버튼 아이콘
+btn_icon_pd = np.zeros((icon_base_size, icon_base_size, 3), dtype=np.uint8)
+btn_icon_pd[:] = (0, 128, 255)
+cv2.putText(btn_icon_pd, "PD", (int(icon_base_size * 0.15), int(icon_base_size * 0.7)), cv2.FONT_HERSHEY_SIMPLEX,
+            button_text_scale * 0.8, (255, 255, 255), button_text_thickness, cv2.LINE_AA)
+
+btn_icon_dd = np.zeros((icon_base_size, icon_base_size, 3), dtype=np.uint8)
+btn_icon_dd[:] = (255, 255, 0)
+cv2.putText(btn_icon_dd, "DD", (int(icon_base_size * 0.15), int(icon_base_size * 0.7)), cv2.FONT_HERSHEY_SIMPLEX,
+            button_text_scale * 0.8, (0, 0, 0), button_text_thickness, cv2.LINE_AA)
+
+btn_icon_td = np.zeros((icon_base_size, icon_base_size, 3), dtype=np.uint8)
+btn_icon_td[:] = (255, 0, 255)
+cv2.putText(btn_icon_td, "TD", (int(icon_base_size * 0.15), int(icon_base_size * 0.7)), cv2.FONT_HERSHEY_SIMPLEX,
+            button_text_scale * 0.8, (255, 255, 255), button_text_thickness, cv2.LINE_AA)
+
+# 새롭게 추가된 아이콘
+# 영역 필터 (Region Filter) 아이콘
+btn_icon_region = np.zeros((icon_base_size, icon_base_size, 3), dtype=np.uint8)
+btn_icon_region[:] = (255, 100, 0) # 밝은 파란색
+cv2.putText(btn_icon_region, "ROI", (int(icon_base_size * 0.15), int(icon_base_size * 0.7)), cv2.FONT_HERSHEY_SIMPLEX,
+            button_text_scale * 0.8, (255, 255, 255), button_text_thickness, cv2.LINE_AA)
+
+# 별 필터 (Star Filter) 아이콘
+btn_icon_star = np.zeros((icon_base_size, icon_base_size, 3), dtype=np.uint8)
+btn_icon_star[:] = (0, 0, 255) # 빨간색
+cv2.putText(btn_icon_star, "*", (int(icon_base_size * 0.35), int(icon_base_size * 0.7)), cv2.FONT_HERSHEY_SIMPLEX,
+            button_text_scale * 1.5, (255, 255, 0), button_text_thickness +1, cv2.LINE_AA)
+
+
+ACTIVE_OVERLAY_COLOR = (0, 255, 255)
+ACTIVE_OVERLAY_ALPHA = 0.5
+padding = 15
+item_spacing = 10
+
+# UI panel_height를 전역 변수로 선언하여 mouse callback에서도 참조 가능하게 함
+panel_height = 70
+
+
+# 마우스 콜백 함수 (드래그 및 버튼 클릭 모두 처리)
+def handle_mouse_events(event, x, y, flags, param):
+    global active_cb_type, active_cb_mode, active_special_filter
+    global drawing, ix, iy, rx1, ry1, rx2, ry2
+    global panel_height # 전역 변수 panel_height 참조
+
+    # UI 버튼 영역 계산 (전역 panel_height 사용)
+    btn_sim_y_start = panel_height + padding
+    btn_rects_sim = {
+        "protan": {'x': padding, 'y': btn_sim_y_start, 'w': icon_base_size, 'h': icon_base_size},
+        "deutan": {'x': padding + icon_base_size + item_spacing, 'y': btn_sim_y_start, 'w': icon_base_size, 'h': icon_base_size},
+        "tritan": {'x': padding + 2 * (icon_base_size + item_spacing), 'y': btn_sim_y_start, 'w': icon_base_size, 'h': icon_base_size}
+    }
+    btn_corr_y_start = btn_sim_y_start + icon_base_size + item_spacing
+    btn_rects_corr = {
+        "protan": {'x': padding, 'y': btn_corr_y_start, 'w': icon_base_size, 'h': icon_base_size},
+        "deutan": {'x': padding + icon_base_size + item_spacing, 'y': btn_corr_y_start, 'w': icon_base_size, 'h': icon_base_size},
+        "tritan": {'x': padding + 2 * (icon_base_size + item_spacing), 'y': btn_corr_y_start, 'w': icon_base_size, 'h': icon_base_size}
+    }
+
+    btn_special_y_start = btn_corr_y_start + icon_base_size + item_spacing
+    btn_rect_region = {'x': padding, 'y': btn_special_y_start, 'w': icon_base_size, 'h': icon_base_size}
+    btn_rect_star = {'x': padding + icon_base_size + item_spacing, 'y': btn_special_y_start, 'w': icon_base_size, 'h': icon_base_size}
+
+
+    # 마우스 드래그 (ROI) 처리
+    if active_special_filter == "region_filter":
+        if event == cv2.EVENT_LBUTTONDOWN:
+            print(f"DEBUG: LBUTTONDOWN at ({x},{y}), starting ROI selection.")
+            drawing = True
+            ix, iy = x, y
+            rx1, ry1, rx2, ry2 = -1, -1, -1, -1 # 새 드래그 시작 시 기존 ROI 초기화
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if drawing:
+                # print(f"DEBUG: MouseMove - Drawing ROI from ({ix},{iy}) to ({x},{y})") # 너무 많은 로그 방지
+                rx1, ry1, rx2, ry2 = ix, iy, x, y
+        elif event == cv2.EVENT_LBUTTONUP:
+            drawing = False
+            # 드래그가 끝났을 때 ROI를 유효하게 저장
+            rx1_temp, ry1_temp = min(ix, x), min(iy, y)
+            rx2_temp, ry2_temp = max(ix, x), max(iy, y)
+
+            # ROI가 너무 작거나 유효하지 않으면 초기화 (5x5 픽셀 미만 무시)
+            if abs(rx2_temp - rx1_temp) < 5 or abs(ry2_temp - ry1_temp) < 5:
+                rx1, ry1, rx2, ry2 = -1, -1, -1, -1
+                print("DEBUG: Invalid ROI (too small), reset.")
+            else:
+                rx1, ry1, rx2, ry2 = rx1_temp, ry1_temp, rx2_temp, ry2_temp
+                print(f"DEBUG: ROI selected: ({rx1}, {ry1}) to ({rx2}, {ry2}).")
+    elif event == cv2.EVENT_LBUTTONDOWN: # 드래그 모드가 아니면 버튼 클릭만 처리
+        # 초기화
+        new_cb_type = None
+        new_cb_mode = None
+        new_special_filter = None
+        
+        # 시뮬레이션 버튼 클릭 확인
+        for cb_type_key, rect in btn_rects_sim.items():
+            if rect['x'] <= x <= rect['x'] + rect['w'] and rect['y'] <= y <= rect['y'] + rect['h']:
+                new_cb_type = cb_type_key
+                new_cb_mode = "simulate"
+                new_special_filter = None # 색약 시뮬레이션/보정 활성화 시 다른 특수 필터 비활성화
+                break
+
+        # 보정 버튼 클릭 확인
+        if new_cb_type is None:
+            for cb_type_key, rect in btn_rects_corr.items():
+                if rect['x'] <= x <= rect['x'] + rect['w'] and rect['y'] <= y <= rect['y'] + rect['h']:
+                    new_cb_type = cb_type_key
+                    new_cb_mode = "correct"
+                    new_special_filter = None
+                    break
+
+        # 영역 필터 (ROI) 버튼 클릭 확인
+        if new_cb_type is None and btn_rect_region['x'] <= x <= btn_rect_region['x'] + btn_rect_region['w'] and \
+           btn_rect_region['y'] <= y <= btn_rect_region['y'] + btn_rect_region['h']:
+            new_special_filter = "region_filter"
+            new_cb_type = None
+            new_cb_mode = None
+            if active_special_filter == "region_filter": # 다시 클릭 시 토글
+                new_special_filter = None
+                drawing = False # 드래그 상태도 해제
+                rx1, ry1, rx2, ry2 = -1, -1, -1, -1 # ROI 초기화
+                print("DEBUG: Region Filter Disabled. ROI reset.")
+            else:
+                print("DEBUG: Region Filter Enabled. Drag to select ROI.")
+
+        # 별 필터 버튼 클릭 확인
+        if new_cb_type is None and new_special_filter is None and btn_rect_star['x'] <= x <= btn_rect_star['x'] + btn_rect_star['w'] and \
+           btn_rect_star['y'] <= y <= btn_rect_star['y'] + btn_rect_star['h']:
+            new_special_filter = "star_filter"
+            new_cb_type = None
+            new_cb_mode = None
+            if active_special_filter == "star_filter": # 다시 클릭 시 토글
+                new_special_filter = None
+                print("DEBUG: Star Filter Disabled.")
+            else:
+                print("DEBUG: Star Filter Enabled.")
+
+        # 상태 업데이트
+        if new_cb_type is not None:
+            if active_cb_type == new_cb_type and active_cb_mode == new_cb_mode: # 같은 버튼 다시 누르면 해제
+                active_cb_type = None
+                active_cb_mode = None
+                active_special_filter = None # 색약 필터 해제 시 특수 필터도 해제
+                rx1, ry1, rx2, ry2 = -1, -1, -1, -1 # ROI 초기화
+                drawing = False
+                print("DEBUG: Colorblind Filter Disabled.")
+            else:
+                active_cb_type = new_cb_type
+                active_cb_mode = new_cb_mode
+                active_special_filter = None # 색약 필터 활성화 시 특수 필터 해제
+                print(f"DEBUG: Colorblind Filter: {active_cb_type.capitalize()} {active_cb_mode.capitalize()} Enabled.")
+                # 필터 전환 시 ROI 초기화 (새로운 필터에 이전 ROI가 남아있지 않도록)
+                rx1, ry1, rx2, ry2 = -1, -1, -1, -1
+                drawing = False
+        elif new_special_filter is not None: # 특수 필터만 활성화 (색약 필터는 비활성화)
+            # 이전 특수 필터와 동일한 필터를 다시 클릭한 경우 토글
+            if active_special_filter == new_special_filter:
+                active_special_filter = None
+                drawing = False
+                rx1, ry1, rx2, ry2 = -1, -1, -1, -1
+                print(f"DEBUG: {new_special_filter.replace('_', ' ').capitalize()} Disabled.")
+            else:
+                active_special_filter = new_special_filter
+                active_cb_type = None
+                active_cb_mode = None
+                print(f"DEBUG: {active_special_filter.replace('_', ' ').capitalize()} Enabled.")
+                if active_special_filter != "region_filter": # ROI 필터가 아니면 ROI 초기화
+                    rx1, ry1, rx2, ry2 = -1, -1, -1, -1
+                    drawing = False
+        else: # 모든 필터 해제 (클릭한 버튼이 없거나 같은 버튼 다시 클릭하여 해제된 경우)
+            active_cb_type = None
+            active_cb_mode = None
+            active_special_filter = None
+            drawing = False
+            rx1, ry1, rx2, ry2 = -1, -1, -1, -1 # ROI 초기화
+            print("DEBUG: All filters disabled.")
+
+# --- 메인 비디오 처리 루프 ---
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Could not open video stream.")
+    exit()
+
+window_title = "Color Detector & Color Blindness Simulation/Correction ('ESC': Exit)"
+cv2.namedWindow(window_title)
+cv2.setMouseCallback(window_title, handle_mouse_events) # 변경된 콜백 함수
+
+cv2.createTrackbar("Severity (x100)", window_title, 100, 200, lambda x: None)
+
+ret, initial_frame = cap.read()
+if not ret:
+    print("Could not read initial frame. Exiting.")
+    exit()
+
+original_h, original_w, _ = initial_frame.shape
+scale_factor = 1.5
+
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Could not receive frame (stream end?). Exiting...")
+        break
+
+    frame = cv2.resize(frame, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_LINEAR)
+
+    h, w, _ = frame.shape
+    center_x, center_y = w // 2, h // 2
+
+    # 중앙 픽셀 색상 정보 가져오기 (확대된 프레임 기준)
+    b_orig, g_orig, r_orig = frame[center_y, center_x]
+    rgb_at_center = (r_orig, g_orig, b_orig)
+    color_name_at_center = get_color_name(rgb_at_center)
+
+    severity_val = cv2.getTrackbarPos("Severity (x100)", window_title)
+    severity = severity_val / 100.0
+
+    processed_frame = frame.copy()
+    current_frame_to_display = frame.copy() # 최종 디스플레이될 프레임
+
+    # 별 필터 적용 (ROI와 별개로 동작)
+    if active_special_filter == "star_filter":
+        print("DEBUG: Applying Star Filter.")
+        processed_frame = draw_stars(processed_frame, 0, 0, w, h) # 전체 화면에 별 그리기
+        current_frame_to_display = processed_frame.copy()
+
+    # 색약 필터 (시뮬레이션/보정) 적용
+    if active_cb_type and active_cb_mode:
+        if active_special_filter == "region_filter" and rx1 != -1 and ry1 != -1 and rx2 != -1 and ry2 != -1:
+            # ROI가 유효할 경우 ROI에만 필터 적용
+            # rx1, ry1, rx2, ry2를 프레임 크기에 맞춰 클리핑
+            current_rx1 = max(0, min(rx1, w))
+            current_ry1 = max(0, min(ry1, h))
+            current_rx2 = max(0, min(rx2, w))
+            current_ry2 = max(0, min(ry2, h))
+
+            print(f"DEBUG: Applying {active_cb_type.capitalize()} {active_cb_mode.capitalize()} to ROI: Original ({rx1},{ry1})-({rx2},{ry2}), Clipped ({current_rx1},{current_ry1})-({current_rx2},{current_ry2})")
+
+            if current_rx2 > current_rx1 and current_ry2 > current_ry1: # 유효한 ROI인 경우에만
+                roi = processed_frame[current_ry1:current_ry2, current_rx1:current_rx2].copy()
+                if active_cb_mode == "simulate":
+                    filtered_roi = simulate_colorblind_machado(roi, active_cb_type, severity=severity)
+                elif active_cb_mode == "correct":
+                    filtered_roi = daltonize(roi, active_cb_type, severity=severity, amplify=1.5)
+                processed_frame[current_ry1:current_ry2, current_rx1:current_rx2] = filtered_roi
+                print("DEBUG: ROI filter applied.")
+            else:
+                print("DEBUG: ROI is invalid (width or height <= 0 after clipping), skipping ROI filter.")
+        else:
+            # ROI가 없거나 영역 필터 모드가 아닐 경우 전체 화면에 필터 적용
+            print(f"DEBUG: Applying {active_cb_type.capitalize()} {active_cb_mode.capitalize()} to full frame.")
+            if active_cb_mode == "simulate":
+                processed_frame = simulate_colorblind_machado(processed_frame, active_cb_type, severity=severity)
+            elif active_cb_mode == "correct":
+                processed_frame = daltonize(processed_frame, active_cb_type, severity=severity, amplify=1.5)
+        current_frame_to_display = processed_frame.copy()
+    elif active_special_filter != "star_filter": # 어떤 필터도 활성화되지 않았을 때 원본 프레임 표시
+        current_frame_to_display = frame.copy()
+
+    # 드래그 중이거나 ROI가 활성화된 경우 사각형 그리기 (필터 적용 후 프레임에)
+    if active_special_filter == "region_filter":
+        if drawing and ix != -1 and iy != -1 : # 드래그 중인 경우 (ix,iy가 초기화되지 않았을 때)
+            cv2.rectangle(current_frame_to_display, (ix, iy), (x, y), (0, 255, 0), 2)
+            # print(f"DEBUG: Drawing temporary ROI rect from ({ix},{iy}) to ({x},{y})") # 너무 많은 로그 방지
+        elif rx1 != -1 and ry1 != -1 and rx2 != -1 and ry2 != -1: # 드래그 완료된 유효한 ROI
+            cv2.rectangle(current_frame_to_display, (rx1, ry1), (rx2, ry2), (0, 255, 0), 2)
+            # print(f"DEBUG: Drawing final ROI rect from ({rx1},{ry1}) to ({rx2},{ry2})")
+
+
+    display_frame = current_frame_to_display.copy()
+
+    # --- UI 요소 그리기 ---
+    panel_width = w
+    cv2.rectangle(display_frame, (0, 0), (panel_width, panel_height), (0, 0, 0), -1)
+    cv2.rectangle(display_frame, (0, 0), (panel_width, panel_height), (50, 50, 50), 2)
+
+    font_face = cv2.FONT_HERSHEY_SIMPLEX
+    main_font_scale = 0.8
+    sub_font_scale = 0.6
+    font_thickness = 2
+    text_color_white = (255, 255, 255)
+    text_color_yellow = (0, 255, 255)
+
+    mode_display_text = "Mode: None"
+    severity_display_text = ""
+
+    if active_special_filter == "region_filter":
+        mode_display_text = "Mode: Region Filter (Drag to select)"
+    elif active_special_filter == "star_filter":
+        mode_display_text = "Mode: Star Filter"
+    elif active_cb_type and active_cb_mode:
+        mode_display_text = f"Mode: {active_cb_type.capitalize()} {active_cb_mode.capitalize()}"
+        severity_display_text = f"Severity: {severity:.2f}"
+
+    text_size_mode, _ = cv2.getTextSize(mode_display_text, font_face, sub_font_scale, font_thickness)
+    text_size_severity, _ = cv2.getTextSize(severity_display_text, font_face, sub_font_scale, font_thickness)
+
+    cv2.putText(display_frame, mode_display_text,
+                (w - text_size_mode[0] - padding, 25), font_face, sub_font_scale, text_color_yellow, font_thickness,
+                cv2.LINE_AA)
+    cv2.putText(display_frame, severity_display_text,
+                (w - text_size_severity[0] - padding, 55), font_face, sub_font_scale, text_color_yellow, font_thickness,
+                cv2.LINE_AA)
+
+    rgb_text = f"RGB: ({rgb_at_center[0]}, {rgb_at_center[1]}, {rgb_at_center[2]})"
+    cv2.putText(display_frame, rgb_text,
+                (padding, 35), font_face, main_font_scale, text_color_white, font_thickness, cv2.LINE_AA)
+
+    # 버튼 배치 재정렬
+    btn_sim_y_start = panel_height + padding
+    btn_rects_sim = {
+        "protan": {'x': padding, 'y': btn_sim_y_start, 'w': icon_base_size, 'h': icon_base_size, 'icon': btn_icon_p},
+        "deutan": {'x': padding + icon_base_size + item_spacing, 'y': btn_sim_y_start, 'w': icon_base_size, 'h': icon_base_size, 'icon': btn_icon_d},
+        "tritan": {'x': padding + 2 * (icon_base_size + item_spacing), 'y': btn_sim_y_start, 'w': icon_base_size, 'h': icon_base_size, 'icon': btn_icon_t}
+    }
+    btn_corr_y_start = btn_sim_y_start + icon_base_size + item_spacing
+    btn_rects_corr = {
+        "protan": {'x': padding, 'y': btn_corr_y_start, 'w': icon_base_size, 'h': icon_base_size, 'icon': btn_icon_pd},
+        "deutan": {'x': padding + icon_base_size + item_spacing, 'y': btn_corr_y_start, 'w': icon_base_size, 'h': icon_base_size, 'icon': btn_icon_dd},
+        "tritan": {'x': padding + 2 * (icon_base_size + item_spacing), 'y': btn_corr_y_start, 'w': icon_base_size, 'h': icon_base_size, 'icon': btn_icon_td}
+    }
+
+    # 새로운 특수 필터 버튼 배치
+    btn_special_y_start = btn_corr_y_start + icon_base_size + item_spacing
+    btn_rects_special = {
+        "region_filter": {'x': padding, 'y': btn_special_y_start, 'w': icon_base_size, 'h': icon_base_size, 'icon': btn_icon_region},
+        "star_filter": {'x': padding + icon_base_size + item_spacing, 'y': btn_special_y_start, 'w': icon_base_size, 'h': icon_base_size, 'icon': btn_icon_star}
+    }
+
+    # 버튼 그리기 및 활성화 상태 표시 (시뮬레이션/보정)
+    for cb_type_key, rect in btn_rects_sim.items():
+        display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']] = rect['icon']
+        if active_cb_type == cb_type_key and active_cb_mode == "simulate":
+            overlay = display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']].copy()
+            cv2.rectangle(overlay, (0, 0), (rect['w'], rect['h']), ACTIVE_OVERLAY_COLOR, -1)
+            cv2.addWeighted(overlay, ACTIVE_OVERLAY_ALPHA,
+                            display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']],
+                            1 - ACTIVE_OVERLAY_ALPHA, 0,
+                            display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']])
+            cv2.rectangle(display_frame, (rect['x'], rect['y']), (rect['x'] + rect['w'], rect['y'] + rect['h']),
+                          ACTIVE_OVERLAY_COLOR, 3)
+
+    for cb_type_key, rect in btn_rects_corr.items():
+        display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']] = rect['icon']
+        if active_cb_type == cb_type_key and active_cb_mode == "correct":
+            overlay = display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']].copy()
+            cv2.rectangle(overlay, (0, 0), (rect['w'], rect['h']), ACTIVE_OVERLAY_COLOR, -1)
+            cv2.addWeighted(overlay, ACTIVE_OVERLAY_ALPHA,
+                            display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']],
+                            1 - ACTIVE_OVERLAY_ALPHA, 0,
+                            display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']])
+            cv2.rectangle(display_frame, (rect['x'], rect['y']), (rect['x'] + rect['w'], rect['y'] + rect['h']),
+                          ACTIVE_OVERLAY_COLOR, 3)
+
+    # 버튼 그리기 및 활성화 상태 표시 (특수 필터)
+    for filter_key, rect in btn_rects_special.items():
+        display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']] = rect['icon']
+        if active_special_filter == filter_key:
+            overlay = display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']].copy()
+            cv2.rectangle(overlay, (0, 0), (rect['w'], rect['h']), ACTIVE_OVERLAY_COLOR, -1)
+            cv2.addWeighted(overlay, ACTIVE_OVERLAY_ALPHA,
+                            display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']],
+                            1 - ACTIVE_OVERLAY_ALPHA, 0,
+                            display_frame[rect['y']:rect['y'] + rect['h'], rect['x']:rect['x'] + rect['w']])
+            cv2.rectangle(display_frame, (rect['x'], rect['y']), (rect['x'] + rect['w'], rect['y'] + rect['h']),
+                          ACTIVE_OVERLAY_COLOR, 3)
+
+    # 중앙 십자선
+    cv2.drawMarker(display_frame, (center_x, center_y), (200, 200, 200), cv2.MARKER_CROSS, 20, 1)
+
+    # --- 하단 UI 요소 (색상 정보, 스펙트럼 바) ---
+    spectrum_bar_height = 40
+    brightness_bar_height = 40
+    spectrum_bar_width = w - 2 * padding
+
+    color_text = f"Color: {color_name_at_center}"
+    text_size_color, _ = cv2.getTextSize(color_text, font_face, main_font_scale, font_thickness)
+
+    color_text_y_pos_bottom = h - padding
+    color_text_y_pos_top = color_text_y_pos_bottom - text_size_color[1] - 5
+
+    spectrum_y_start = color_text_y_pos_top - item_spacing - spectrum_bar_height
+    brightness_y_start = spectrum_y_start - item_spacing - brightness_bar_height
+
+    cv2.rectangle(display_frame,
+                  (padding - 5, color_text_y_pos_top - 5),
+                  (padding + text_size_color[0] + 5, color_text_y_pos_bottom + 5),
+                  (0, 0, 0), -1)
+
+    cv2.putText(display_frame, color_text,
+                (padding, color_text_y_pos_bottom), font_face, main_font_scale, text_color_white, font_thickness,
+                cv2.LINE_AA)
+
+    sample_box_size = 40
+    sample_box_x = padding + text_size_color[0] + item_spacing + 20
+    sample_box_y = color_text_y_pos_top
+    cv2.rectangle(display_frame,
+                  (sample_box_x, sample_box_y),
+                  (sample_box_x + sample_box_size, sample_box_y + sample_box_size),
+                  tuple(map(int, rgb_at_center[::-1])), -1)
+    cv2.rectangle(display_frame,
+                  (sample_box_x, sample_box_y),
+                  (sample_box_x + sample_box_size, sample_box_y + sample_box_size),
+                  (200, 200, 200), 1)
+
+    spectrum = np.zeros((spectrum_bar_height, spectrum_bar_width, 3), dtype=np.uint8)
+    for i in range(spectrum_bar_width):
+        hsv_color = np.uint8([[[i * 180 // spectrum_bar_width, 255, 255]]])
+        bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
+        spectrum[:, i] = bgr_color
+
+    display_frame[spectrum_y_start:spectrum_y_start + spectrum_bar_height,
+    padding:padding + spectrum_bar_width] = spectrum
+    cv2.rectangle(display_frame,
+                  (padding, spectrum_y_start),
+                  (padding + spectrum_bar_width, spectrum_y_start + spectrum_bar_height),
+                  (200, 200, 200), 1)
+
+    hsv_original_center_color = cv2.cvtColor(np.uint8([[rgb_at_center[::-1]]]), cv2.COLOR_BGR2HSV)[0][0]
+    hue_val_from_cv = hsv_original_center_color[0]
+    sat_val_from_cv = hsv_original_center_color[1]
+    val_val_from_cv = hsv_original_center_color[2]
+
+    clipped_hue = np.clip(hue_val_from_cv, 0, 179)
+    hue_pos_float = float(clipped_hue) * spectrum_bar_width / 180.0
+    hue_pos_on_bar = int(hue_pos_float) + padding
+    hue_pos_on_bar = max(padding, min(hue_pos_on_bar, w - padding - 1))
+
+    cv2.line(display_frame, (hue_pos_on_bar, spectrum_y_start),
+             (hue_pos_on_bar, spectrum_y_start + spectrum_bar_height), (255, 255, 255), 2)
+
+    brightness_spectrum = np.zeros((brightness_bar_height, spectrum_bar_width, 3), dtype=np.uint8)
+    for i in range(spectrum_bar_width):
+        gray_val = int(i * 255 / spectrum_bar_width)
+        brightness_spectrum[:, i] = (gray_val, gray_val, gray_val)
+
+    display_frame[brightness_y_start:brightness_y_start + brightness_bar_height,
+    padding:padding + spectrum_bar_width] = brightness_spectrum
+    cv2.rectangle(display_frame,
+                  (padding, brightness_y_start),
+                  (padding + spectrum_bar_width, brightness_y_start + brightness_bar_height),
+                  (200, 200, 200), 1)
+
+    brightness_pos_float = float(val_val_from_cv) * spectrum_bar_width / 255.0
+    brightness_pos_on_bar = int(brightness_pos_float) + padding
+    brightness_pos_on_bar = max(padding, min(brightness_pos_on_bar, w - padding - 1))
+
+    cv2.line(display_frame, (brightness_pos_on_bar, brightness_y_start),
+             (brightness_pos_on_bar, brightness_y_start + brightness_bar_height), (255, 255, 255), 2)
+
+    cv2.imshow(window_title, display_frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
